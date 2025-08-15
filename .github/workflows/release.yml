@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
   packages: write
 
 env:
@@ -14,53 +16,96 @@ env:
 
 jobs:
   semver:
-    name: Semantic Version
+    name: Determine Version (semantic-release)
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-      version: ${{ steps.tag.outputs.version }}
-      released: ${{ steps.semrel.outputs.released }}
+      tag: ${{ steps.after.outputs.tag }}
+      version: ${{ steps.after.outputs.version }}
+      no_new_release: ${{ steps.decide.outputs.no_new_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # semantic-release needs full history
 
-      - name: Set up Node (for semantic-release)
+      # Create a release config on-the-fly (no npm publish plugin)
+      - name: Write .releaserc.json
+        run: |
+          cat > .releaserc.json <<'JSON'
+          {
+            "branches": ["main"],
+            "plugins": [
+              ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+              ["@semantic-release/release-notes-generator", { "preset": "conventionalcommits" }],
+              ["@semantic-release/changelog", { "changelogFile": "CHANGELOG.md" }],
+              ["@semantic-release/github"],
+              ["@semantic-release/git", {
+                "assets": ["CHANGELOG.md"],
+                "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+              }]
+            ]
+          }
+          JSON
+          cat .releaserc.json
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
+      # Install semantic-release and only the plugins we use (no npm plugin)
       - name: Install semantic-release
         run: |
-          npm -g i semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github conventional-changelog-conventionalcommits
+          npm -g i \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/git \
+            @semantic-release/github \
+            conventional-changelog-conventionalcommits \
+            @semantic-release/commit-analyzer \
+            @semantic-release/release-notes-generator
+
+      - name: Previous tag (before)
+        id: before
+        run: |
+          git fetch --tags --force || true
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "prev=${PREV}" >> $GITHUB_OUTPUT
+          echo "Previous tag: ${PREV}"
 
       - name: Run semantic-release
         id: semrel
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # semantic-release will create a new tag/release if commits warrant it
-          npx semantic-release
+          # Creates/updates GitHub Release & tag if commits since last tag warrant a new version
+          npx semantic-release --no-ci
 
-          # Expose flag whether a release was created (exit code 0 even when no new release)
-          # semantic-release prints "Published release x.y.z" lines; we don't rely on parsing.
-          echo "released=true" >> $GITHUB_OUTPUT || true
-
-      - name: Get latest tag (after semantic-release)
-        id: tag
+      - name: Latest tag (after)
+        id: after
         run: |
           git fetch --tags --force
-          TAG=$(git describe --tags --abbrev=0)
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
           echo "Latest tag: ${TAG}; version: ${TAG#v}"
 
+      - name: Decide if a new release was created
+        id: decide
+        run: |
+          if [ "${{ steps.before.outputs.prev }}" = "${{ steps.after.outputs.tag }}" ] || [ -z "${{ steps.after.outputs.tag }}" ]; then
+            echo "no_new_release=true" >> $GITHUB_OUTPUT
+            echo "No new release created."
+          else
+            echo "no_new_release=false" >> $GITHUB_OUTPUT
+            echo "New release: ${{ steps.after.outputs.tag }}"
+          fi
+
   docker:
-    name: Build & Push Docker
+    name: Build & Push Docker (latest + version tags)
     needs: semver
+    if: ${{ needs.semver.outputs.no_new_release == 'false' && needs.semver.outputs.tag != '' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.semver.outputs.tag != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,10 +137,10 @@ jobs:
             ${{ env.DOCKER_IMAGE }}:${{ needs.semver.outputs.tag }}
 
   binaries:
-    name: Build Binaries (macOS/Linux)
+    name: Build & Upload Binaries (macOS/Linux)
     needs: semver
+    if: ${{ needs.semver.outputs.no_new_release == 'false' && needs.semver.outputs.tag != '' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.semver.outputs.tag != '' }}
     strategy:
       fail-fast: false
       matrix:
