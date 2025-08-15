@@ -1,0 +1,25 @@
+# Go build artifacts
+/bin
+/out
+/build
+dist
+*.exe
+*.test
+*.out
+
+# Modules cache (optional to reduce context size)
+**/vendor
+go.work
+go.work.sum
+
+# VCS / editor / OS noise
+.git
+.gitignore
+.gitattributes
+.idea
+.vscode
+.DS_Store
+
+# Local configs and secrets you don’t want baked accidentally
+.env
+*.local.yaml
