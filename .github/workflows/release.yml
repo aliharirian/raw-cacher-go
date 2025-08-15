@@ -1,0 +1,132 @@
+name: Release & Publish
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  DOCKER_IMAGE: aliharirian/raw-cacher-go
+
+jobs:
+  semver:
+    name: Semantic Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      released: ${{ steps.semrel.outputs.released }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # semantic-release needs full history
+
+      - name: Set up Node (for semantic-release)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install semantic-release
+        run: |
+          npm -g i semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github conventional-changelog-conventionalcommits
+
+      - name: Run semantic-release
+        id: semrel
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # semantic-release will create a new tag/release if commits warrant it
+          npx semantic-release
+
+          # Expose flag whether a release was created (exit code 0 even when no new release)
+          # semantic-release prints "Published release x.y.z" lines; we don't rely on parsing.
+          echo "released=true" >> $GITHUB_OUTPUT || true
+
+      - name: Get latest tag (after semantic-release)
+        id: tag
+        run: |
+          git fetch --tags --force
+          TAG=$(git describe --tags --abbrev=0)
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "Latest tag: ${TAG}; version: ${TAG#v}"
+
+  docker:
+    name: Build & Push Docker
+    needs: semver
+    runs-on: ubuntu-latest
+    if: ${{ needs.semver.outputs.tag != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.semver.outputs.version }}
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ needs.semver.outputs.version }}
+            ${{ env.DOCKER_IMAGE }}:${{ needs.semver.outputs.tag }}
+
+  binaries:
+    name: Build Binaries (macOS/Linux)
+    needs: semver
+    runs-on: ubuntu-latest
+    if: ${{ needs.semver.outputs.tag != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [ linux, darwin ]
+        goarch: [ amd64, arm64 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.semver.outputs.version }}
+        run: |
+          mkdir -p dist
+          BIN_NAME=raw-cacher-go_${GOOS}_${GOARCH}
+          if [ "${GOOS}" = "windows" ]; then BIN_NAME="${BIN_NAME}.exe"; fi
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${BIN_NAME}" ./cmd/server
+
+      - name: Upload binaries to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.semver.outputs.tag }}
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
