@@ -1,0 +1,41 @@
+# Binaries
+/bin
+/out
+/build
+/dist
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directories (if vendoring)
+vendor/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE / editor settings
+.idea/
+.vscode/
+*.swp
+
+# Env & config overrides
+.env
+*.local.yaml
+*.local.yml
+config.local.yaml
+config.local.yml
+
+# Coverage reports
+coverage.*
