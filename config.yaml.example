@@ -1,0 +1,10 @@
+minio_endpoint: "http://localhost:9000"
+minio_access_key: "minio"
+minio_secret_key: "minio12345"
+minio_bucket: "proxy-cache"
+
+ttl_default: 3600
+ttl_404: 60
+serve_if_present: true
+
+listen_addr: ":8080"

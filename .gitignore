@@ -29,6 +29,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+config.yaml
 
 # Env & config overrides
 .env
