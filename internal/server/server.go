@@ -6,16 +6,26 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"github.com/yourname/raw-cacher-go/internal/cache"
 	"github.com/yourname/raw-cacher-go/internal/httpx"
-	"github.com/yourname/raw-cacher-go/internal/storage"
 )
 
+// Store is the minimal storage interface satisfied by your MinIO store.
+// You can swap implementations (e.g., filesystem) without changing the handler.
+type Store interface {
+	HasObject(ctx context.Context, key string) (bool, error)
+	GetObject(ctx context.Context, key string) (io.ReadCloser, int64, map[string]string, error)
+	PutObject(ctx context.Context, key string, data []byte, contentType string) error
+	ReadMeta(ctx context.Context, key string) (cache.Meta, bool, error)
+	WriteMeta(ctx context.Context, key string, m cache.Meta) error
+}
+
 type Server struct {
-	Store          *storage.Store
+	Store          Store
 	Client         *http.Client
 	TTLDefault     int
 	TTL404         int
@@ -23,7 +33,7 @@ type Server struct {
 	sf             singleflight.Group
 }
 
-func NewServer(store *storage.Store, ttlDefault, ttl404 int, serveIf bool) *Server {
+func NewServer(store Store, ttlDefault, ttl404 int, serveIf bool) *Server {
 	return &Server{
 		Store:          store,
 		Client:         httpx.NewUpstreamClient(),
@@ -36,17 +46,16 @@ func NewServer(store *storage.Store, ttlDefault, ttl404 int, serveIf bool) *Serv
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	domain, route, err := splitDomainAndRoute(r.URL.Path)
+	domain, route, upstreamURL, err := parseAndBuildUpstream(r.URL.Path, r.URL.RawQuery)
 	if err != nil {
 		http.Error(w, "path must be /<domain>/<route>", http.StatusBadRequest)
 		return
 	}
-	upstreamURL := buildUpstreamURL(domain, route, r.URL.RawQuery)
 
 	objKey := cache.ObjectKey(domain, route)
 	metaKey := cache.MetaKey(domain, route)
 
-	// Serve directly from cache if configured
+	// Fast path: serve from cache if present (optional policy)
 	if s.ServeIfPresent {
 		if ok, _ := s.Store.HasObject(ctx, objKey); ok {
 			if s.serveFromCache(ctx, w, objKey) {
@@ -55,7 +64,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Load metadata
+	// Load metadata and decide based on TTL/negative cache
 	meta, hasMeta, _ := s.Store.ReadMeta(ctx, metaKey)
 	if hasMeta && cache.IsNegativeFresh(meta, s.TTL404) {
 		http.Error(w, "Upstream negative-cached 404", http.StatusNotFound)
@@ -69,9 +78,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Consolidate concurrent MISS for the same key
+	// Consolidate concurrent misses per key
 	v, err, _ := s.sf.Do(objKey, func() (any, error) {
-		// Re-check inside singleflight
+		// Re-check under singleflight
 		meta, hasMeta, _ = s.Store.ReadMeta(ctx, metaKey)
 		if hasMeta && cache.IsNegativeFresh(meta, s.TTL404) {
 			return fetchResult{kind: kindNotFound}, nil
@@ -82,74 +91,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Prepare conditional request
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
-		if hasMeta {
-			if meta.ETag != "" {
-				req.Header.Set("If-None-Match", meta.ETag)
-			}
-			if meta.LastModified != "" {
-				req.Header.Set("If-Modified-Since", meta.LastModified)
-			}
-		}
-
-		resp, err := s.Client.Do(req)
+		fr, err := download(ctx, s.Client, upstreamURL, meta)
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
 
-		// 304 → refresh meta timestamp and serve from cache
-		if resp.StatusCode == http.StatusNotModified && hasMeta {
+		switch {
+		case fr.notModified && hasMeta:
 			meta.CachedAt = cache.NowISO()
 			_ = s.Store.WriteMeta(ctx, metaKey, meta)
 			return fetchResult{kind: kindServeCache}, nil
-		}
 
-		// 404 → negative cache
-		if resp.StatusCode == http.StatusNotFound {
+		case fr.status == http.StatusNotFound:
 			_ = s.Store.WriteMeta(ctx, metaKey, cache.Meta{
 				CachedAt: cache.NowISO(),
 				TTL:      s.TTL404,
 				Neg:      true,
 			})
 			return fetchResult{kind: kindNotFound}, nil
+
+		case fr.status < 200 || fr.status >= 300:
+			return fetchResult{kind: kindUpstreamError, status: fr.status}, nil
+
+		default:
+			if err := persist(ctx, s.Store, objKey, metaKey, fr, s.TTLDefault); err != nil {
+				return nil, err
+			}
+			return fetchResult{
+				kind:         kindWroteBody,
+				body:         fr.body,
+				contentType:  fr.contentType,
+				etag:         fr.etag,
+				lastModified: fr.lastModified,
+			}, nil
 		}
-
-		// Other non-2xx
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fetchResult{kind: kindUpstreamError, status: resp.StatusCode}, nil
-		}
-
-		// Read full body (simple path). For large files, consider streaming.
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		ct := resp.Header.Get("Content-Type")
-		etag := resp.Header.Get("ETag")
-		lm := resp.Header.Get("Last-Modified")
-
-		if err := s.Store.PutObject(ctx, objKey, body, ct); err != nil {
-			return nil, err
-		}
-		_ = s.Store.WriteMeta(ctx, metaKey, cache.Meta{
-			ETag:         etag,
-			LastModified: lm,
-			CachedAt:     cache.NowISO(),
-			TTL:          s.TTLDefault,
-			Size:         int64(len(body)),
-			Neg:          false,
-		})
-
-		return fetchResult{
-			kind:         kindWroteBody,
-			body:         body,
-			contentType:  ct,
-			etag:         etag,
-			lastModified: lm,
-		}, nil
 	})
 
 	if err != nil {
@@ -164,19 +139,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "cache read failed", http.StatusInternalServerError)
-		return
 
 	case kindNotFound:
 		http.Error(w, "Upstream 404", http.StatusNotFound)
-		return
 
 	case kindUpstreamError:
 		if res.status >= 400 && res.status <= 599 {
 			http.Error(w, "Upstream error", res.status)
-			return
+		} else {
+			http.Error(w, "Upstream error", http.StatusBadGateway)
 		}
-		http.Error(w, "Upstream error", http.StatusBadGateway)
-		return
 
 	case kindWroteBody:
 		ct := res.contentType
@@ -193,14 +165,83 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.FormatInt(int64(len(res.body)), 10))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(res.body)
-		return
 
 	default:
 		http.Error(w, "unexpected state", http.StatusInternalServerError)
-		return
 	}
 }
 
+// download fetches from the upstream URL with conditional headers if available.
+func download(ctx context.Context, client *http.Client, url string, prior cache.Meta) (fetched, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if prior.ETag != "" {
+		req.Header.Set("If-None-Match", prior.ETag)
+	}
+	if prior.LastModified != "" {
+		req.Header.Set("If-Modified-Since", prior.LastModified)
+	}
+
+	_ = time.Now() // placeholder if you want to add timings/metrics later
+	resp, err := client.Do(req)
+	if err != nil {
+		return fetched{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		return fetched{status: resp.StatusCode, notModified: true}, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fetched{}, err
+	}
+	ct, etag, lm := extractHeaders(resp.Header)
+
+	return fetched{
+		status:       resp.StatusCode,
+		body:         body,
+		contentType:  ct,
+		etag:         etag,
+		lastModified: lm,
+	}, nil
+}
+
+// persist writes the object and metadata to storage.
+func persist(ctx context.Context, st Store, objKey, metaKey string, fr fetched, ttlDefault int) error {
+	if err := st.PutObject(ctx, objKey, fr.body, fr.contentType); err != nil {
+		return err
+	}
+	meta := cache.Meta{
+		ETag:         fr.etag,
+		LastModified: fr.lastModified,
+		CachedAt:     cache.NowISO(),
+		TTL:          ttlDefault,
+		Size:         int64(len(fr.body)),
+		Neg:          false,
+	}
+	return st.WriteMeta(ctx, metaKey, meta)
+}
+
+// parseAndBuildUpstream extracts <domain> and <route> from /<domain>/<route>
+// and builds https://<domain>/<route>?<rawQuery>.
+func parseAndBuildUpstream(path, rawQuery string) (string, string, string, error) {
+	p := strings.TrimPrefix(path, "/")
+	i := strings.IndexByte(p, '/')
+	if i <= 0 {
+		return "", "", "", http.ErrNotSupported
+	}
+	domain := p[:i]
+	route := p[i+1:]
+
+	url := "https://" + strings.TrimRight(domain, "/") + "/" + strings.TrimLeft(route, "/")
+	if rawQuery != "" {
+		url += "?" + rawQuery
+	}
+	return domain, route, url, nil
+}
+
+// serveFromCache streams a cached object to the client.
 func (s *Server) serveFromCache(ctx context.Context, w http.ResponseWriter, key string) bool {
 	rc, size, hdrs, err := s.Store.GetObject(ctx, key)
 	if err != nil {
@@ -218,21 +259,12 @@ func (s *Server) serveFromCache(ctx context.Context, w http.ResponseWriter, key 
 	return true
 }
 
-func splitDomainAndRoute(path string) (string, string, error) {
-	p := strings.TrimPrefix(path, "/")
-	i := strings.IndexByte(p, '/')
-	if i <= 0 {
-		return "", "", http.ErrNotSupported
-	}
-	return p[:i], p[i+1:], nil
-}
-
-func buildUpstreamURL(domain, route, rawQuery string) string {
-	u := "https://" + strings.TrimRight(domain, "/") + "/" + strings.TrimLeft(route, "/")
-	if rawQuery != "" {
-		u += "?" + rawQuery
-	}
-	return u
+// extractHeaders returns Content-Type, ETag, Last-Modified from response headers.
+func extractHeaders(h http.Header) (contentType, etag, lastModified string) {
+	contentType = h.Get("Content-Type")
+	etag = h.Get("ETag")
+	lastModified = h.Get("Last-Modified")
+	return
 }
 
 type fetchKind int
@@ -243,6 +275,15 @@ const (
 	kindUpstreamError
 	kindWroteBody
 )
+
+type fetched struct {
+	status       int
+	notModified  bool
+	body         []byte
+	contentType  string
+	etag         string
+	lastModified string
+}
 
 type fetchResult struct {
 	kind         fetchKind
